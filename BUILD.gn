@@ -34,6 +34,10 @@ if (is_android) {
 }
 
 if (!build_with_chromium) {
+  group("gst_webrtcneteq") {
+    deps = [ "gst/webrtcneteq:webrtcneteq" ]
+  }
+
   # This target should (transitively) cause everything to be built; if you run
   # 'ninja default' and then 'ninja all', the second build should do no work.
   group("default") {

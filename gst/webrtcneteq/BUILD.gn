@@ -1,0 +1,80 @@
+import("//webrtc.gni")
+
+gst_webrtcneteq_packages = [
+  "gstreamer-1.0",
+  "gstreamer-rtp-1.0",
+  "gstreamer-audio-1.0",
+]
+
+declare_args() {
+  gst_webrtcneteq_pkg_config = "pkg-config"
+
+  # Homebrew GStreamer on this mac is built with LC_BUILD_VERSION macos 15.0.
+  # Linux builds do not use this.
+  gst_webrtcneteq_mac_deployment_target = "15.0"
+}
+
+if (is_linux || is_chromeos) {
+  import("//build/config/linux/pkg_config.gni")
+
+  pkg_config("gstreamer_config") {
+    packages = gst_webrtcneteq_packages
+  }
+} else {
+  gst_pkg = exec_script("pkg_config.py",
+                        [ "--pkg-config=$gst_webrtcneteq_pkg_config" ] +
+                            gst_webrtcneteq_packages,
+                        "json")
+
+  config("gstreamer_config") {
+    include_dirs = gst_pkg.include_dirs
+    cflags = gst_pkg.cflags
+    cflags_cc = gst_pkg.cflags_cc + [ "-Wno-unsafe-buffer-usage" ]
+    lib_dirs = gst_pkg.lib_dirs
+    libs = gst_pkg.libs
+    ldflags = gst_pkg.ldflags
+
+    if (is_mac) {
+      ldflags += [
+        "-mmacos-version-min=$gst_webrtcneteq_mac_deployment_target",
+      ]
+    }
+  }
+}
+
+if (is_linux || is_chromeos) {
+  config("gst_webrtcneteq_warnings") {
+    cflags_cc = [ "-Wno-unsafe-buffer-usage" ]
+  }
+} else {
+  config("gst_webrtcneteq_warnings") {
+    cflags_cc = []
+  }
+}
+
+rtc_shared_library("webrtcneteq") {
+  output_name = "gstwebrtcneteq"
+
+  sources = [ "gstwebrtcneteq.cc" ]
+
+  configs += [
+    ":gstreamer_config",
+    ":gst_webrtcneteq_warnings",
+  ]
+
+  allow_poison = [ "environment_construction" ]
+
+  deps = [
+    "//api:rtp_headers",
+    "//api/audio:audio_frame_api",
+    "//api/audio_codecs:audio_codecs_api",
+    "//api/audio_codecs:opus_audio_decoder_factory",
+    "//api/environment",
+    "//api/environment:environment_factory",
+    "//api/neteq:default_neteq_factory",
+    "//api/neteq:neteq_api",
+    "//api/units:timestamp",
+    "//rtc_base:checks",
+    "//third_party/abseil-cpp/absl/types:optional",
+  ]
+}
