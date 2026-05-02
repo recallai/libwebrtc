@@ -120,6 +120,11 @@ struct _GstWebrtcNetEq {
   gint channels;
   gint eos_drain_ms;
 
+  GstSegment segment;
+  gboolean segment_received;
+  gboolean output_base_pts_set;
+  GstClockTime output_base_pts;
+
   PlayoutState playout;
 };
 
@@ -165,6 +170,54 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
                     "channels = (int) [ 1, 2 ]"));
 
 static gpointer gst_webrtc_net_eq_playout_thread(gpointer data);
+
+static GstClockTime gst_webrtc_net_eq_add_latency(GstClockTime latency,
+                                                  GstClockTime extra_latency) {
+  if (latency == GST_CLOCK_TIME_NONE) {
+    return GST_CLOCK_TIME_NONE;
+  }
+  if (G_MAXUINT64 - latency < extra_latency) {
+    return GST_CLOCK_TIME_NONE;
+  }
+  return latency + extra_latency;
+}
+
+static std::optional<GstClockTime> gst_webrtc_net_eq_buffer_timestamp(
+    GstBuffer* buffer) {
+  GstClockTime timestamp = GST_BUFFER_PTS(buffer);
+  if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
+    timestamp = GST_BUFFER_DTS(buffer);
+  }
+  if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
+    return std::nullopt;
+  }
+  return timestamp;
+}
+
+static std::optional<GstClockTime>
+gst_webrtc_net_eq_segment_position_locked(GstWebrtcNetEq* self) {
+  if (!self->segment_received || self->segment.format != GST_FORMAT_TIME) {
+    return std::nullopt;
+  }
+  if (GST_CLOCK_TIME_IS_VALID(self->segment.position)) {
+    return self->segment.position;
+  }
+  if (GST_CLOCK_TIME_IS_VALID(self->segment.start)) {
+    return self->segment.start;
+  }
+  return std::nullopt;
+}
+
+static std::optional<GstClockTime> gst_webrtc_net_eq_output_base_pts_locked(
+    GstWebrtcNetEq* self,
+    GstBuffer* buffer) {
+  const std::optional<GstClockTime> timestamp =
+      gst_webrtc_net_eq_buffer_timestamp(buffer);
+  if (timestamp.has_value()) {
+    return timestamp;
+  }
+  return gst_webrtc_net_eq_segment_position_locked(self);
+}
 
 static std::optional<GstClockTime> gst_webrtc_net_eq_running_time(
     GstWebrtcNetEq* self) {
@@ -218,6 +271,11 @@ static void gst_webrtc_net_eq_stop_task(GstWebrtcNetEq* self,
 static void gst_webrtc_net_eq_reset_state(GstWebrtcNetEq* self) {
   delete self->state;
   self->state = nullptr;
+
+  gst_segment_init(&self->segment, GST_FORMAT_TIME);
+  self->segment_received = FALSE;
+  self->output_base_pts_set = FALSE;
+  self->output_base_pts = GST_CLOCK_TIME_NONE;
 
   self->playout.stop = FALSE;
   self->playout.eos_received = FALSE;
@@ -285,12 +343,13 @@ static gboolean gst_webrtc_net_eq_ensure_neteq(GstWebrtcNetEq* self) {
 
 static webrtc::Timestamp gst_webrtc_net_eq_receive_time(GstWebrtcNetEq* self,
                                                         GstBuffer* buffer) {
-  GstClockTime receive_time = GST_BUFFER_PTS(buffer);
-  if (!GST_CLOCK_TIME_IS_VALID(receive_time)) {
-    receive_time = GST_BUFFER_DTS(buffer);
+  std::optional<GstClockTime> receive_time =
+      gst_webrtc_net_eq_buffer_timestamp(buffer);
+  if (!receive_time.has_value()) {
+    receive_time = gst_webrtc_net_eq_segment_position_locked(self);
   }
 
-  if (!GST_CLOCK_TIME_IS_VALID(receive_time)) {
+  if (!receive_time.has_value()) {
     const std::optional<GstClockTime> running_time =
         gst_webrtc_net_eq_running_time(self);
     if (running_time.has_value()) {
@@ -298,12 +357,12 @@ static webrtc::Timestamp gst_webrtc_net_eq_receive_time(GstWebrtcNetEq* self,
     }
   }
 
-  if (!GST_CLOCK_TIME_IS_VALID(receive_time)) {
+  if (!receive_time.has_value()) {
     return webrtc::Timestamp::MinusInfinity();
   }
 
   return webrtc::Timestamp::Millis(
-      static_cast<int64_t>(receive_time / GST_MSECOND));
+      static_cast<int64_t>(*receive_time / GST_MSECOND));
 }
 
 static gboolean gst_webrtc_net_eq_parse_caps(GstWebrtcNetEq* self,
@@ -400,6 +459,15 @@ static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
   }
   gst_buffer_unmap(output.get(), &map);
 
+  GstAudioInfo audio_info;
+  gst_audio_info_set_format(&audio_info, GST_AUDIO_FORMAT_S16LE, kOutputRateHz,
+                            channels, nullptr);
+  if (gst_buffer_add_audio_meta(output.get(), &audio_info, samples_per_channel,
+                                nullptr) == nullptr) {
+    GST_WARNING_OBJECT(self, "Failed to add audio metadata");
+    return GST_FLOW_ERROR;
+  }
+
   GST_BUFFER_PTS(output.get()) =
       output_base_pts +
       gst_util_uint64_scale(*output_samples, GST_SECOND, kOutputRateHz);
@@ -458,8 +526,16 @@ static gboolean gst_webrtc_net_eq_maybe_pull_locked(
 
 static gpointer gst_webrtc_net_eq_playout_thread(gpointer data) {
   auto* self = GST_WEBRTC_NET_EQ(data);
-  GstClockTime output_base_pts =
-      gst_webrtc_net_eq_running_time(self).value_or(0);
+  GstClockTime output_base_pts;
+  {
+    GMutexLock lock(&self->lock);
+    if (!self->output_base_pts_set) {
+      GST_ERROR_OBJECT(self, "Cannot start playout without output base PTS");
+      self->playout.stop = TRUE;
+      return nullptr;
+    }
+    output_base_pts = self->output_base_pts;
+  }
   guint64 output_samples = 0;
   gint64 next_pull_us = g_get_monotonic_time();
 
@@ -533,6 +609,19 @@ static GstFlowReturn gst_webrtc_net_eq_chain(GstPad* pad,
     return GST_FLOW_ERROR;
   }
 
+  if (!self->output_base_pts_set) {
+    const std::optional<GstClockTime> output_base_pts =
+        gst_webrtc_net_eq_output_base_pts_locked(self, input.get());
+    if (!output_base_pts.has_value()) {
+      GST_WARNING_OBJECT(self,
+                         "Cannot determine output base PTS from buffer or "
+                         "TIME segment");
+      return GST_FLOW_ERROR;
+    }
+    self->output_base_pts = *output_base_pts;
+    self->output_base_pts_set = TRUE;
+  }
+
   GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
   if (!gst_rtp_buffer_map(input.get(), GST_MAP_READ, &rtp)) {
     GST_WARNING_OBJECT(self, "Failed to map RTP buffer");
@@ -579,6 +668,51 @@ static GstFlowReturn gst_webrtc_net_eq_chain(GstPad* pad,
   return GST_FLOW_OK;
 }
 
+static gboolean gst_webrtc_net_eq_src_query(GstPad* pad,
+                                            GstObject* parent,
+                                            GstQuery* query) {
+  auto* self = GST_WEBRTC_NET_EQ(parent);
+
+  switch (GST_QUERY_TYPE(query)) {
+    case GST_QUERY_LATENCY: {
+      gboolean live = FALSE;
+      GstClockTime min_latency = 0;
+      GstClockTime max_latency = GST_CLOCK_TIME_NONE;
+
+      if (gst_pad_peer_query(self->sinkpad, query)) {
+        gst_query_parse_latency(query, &live, &min_latency, &max_latency);
+      } else {
+        GST_DEBUG_OBJECT(self,
+                         "Upstream latency query failed; reporting local "
+                         "NetEQ latency only");
+      }
+
+      gint latency_ms;
+      {
+        GMutexLock lock(&self->lock);
+        latency_ms = self->latency_ms;
+      }
+
+      const GstClockTime neteq_latency =
+          static_cast<GstClockTime>(latency_ms) * GST_MSECOND;
+      min_latency = gst_webrtc_net_eq_add_latency(min_latency, neteq_latency);
+      max_latency = gst_webrtc_net_eq_add_latency(max_latency, neteq_latency);
+
+      gst_query_set_latency(query, TRUE, min_latency, max_latency);
+      GST_DEBUG_OBJECT(self,
+                       "Latency query: upstream_live=%d, neteq_latency=%"
+                       GST_TIME_FORMAT ", min=%" GST_TIME_FORMAT ", max=%"
+                       GST_TIME_FORMAT,
+                       live, GST_TIME_ARGS(neteq_latency),
+                       GST_TIME_ARGS(min_latency), GST_TIME_ARGS(max_latency));
+      return TRUE;
+    }
+
+    default:
+      return gst_pad_query_default(pad, parent, query);
+  }
+}
+
 static gboolean gst_webrtc_net_eq_sink_event(GstPad* pad,
                                              GstObject* parent,
                                              GstEvent* event) {
@@ -606,8 +740,23 @@ static gboolean gst_webrtc_net_eq_sink_event(GstPad* pad,
       return gst_webrtc_net_eq_push_src_caps(self, channels);
     }
 
-    case GST_EVENT_SEGMENT:
+    case GST_EVENT_SEGMENT: {
+      GstSegment segment;
+      gst_event_copy_segment(event, &segment);
+      {
+        GMutexLock lock(&self->lock);
+        if (segment.format == GST_FORMAT_TIME) {
+          self->segment = segment;
+          self->segment_received = TRUE;
+          self->output_base_pts_set = FALSE;
+          self->output_base_pts = GST_CLOCK_TIME_NONE;
+        } else {
+          GST_WARNING_OBJECT(self, "Ignoring non-TIME segment");
+          self->segment_received = FALSE;
+        }
+      }
       return gst_pad_push_event(self->srcpad, event);
+    }
 
     case GST_EVENT_FLUSH_STOP:
       gst_webrtc_net_eq_stop_task(self, FALSE);
@@ -644,9 +793,13 @@ static void gst_webrtc_net_eq_set_property(GObject* object,
     }
     case PROP_LATENCY_MS: {
       gst_webrtc_net_eq_stop_task(self, FALSE);
-      GMutexLock lock(&self->lock);
-      self->latency_ms = g_value_get_int(value);
-      gst_webrtc_net_eq_reset_state(self);
+      {
+        GMutexLock lock(&self->lock);
+        self->latency_ms = g_value_get_int(value);
+        gst_webrtc_net_eq_reset_state(self);
+      }
+      gst_element_post_message(
+          GST_ELEMENT(self), gst_message_new_latency(GST_OBJECT(self)));
       return;
     }
     case PROP_CHANNELS: {
@@ -783,6 +936,8 @@ static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {
   gst_element_add_pad(GST_ELEMENT(self), self->sinkpad);
 
   self->srcpad = gst_pad_new_from_static_template(&src_template, "src");
+  gst_pad_set_query_function(self->srcpad,
+                             GST_DEBUG_FUNCPTR(gst_webrtc_net_eq_src_query));
   gst_element_add_pad(GST_ELEMENT(self), self->srcpad);
 
   g_mutex_init(&self->lock);
@@ -793,6 +948,10 @@ static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {
   self->latency_ms = kDefaultLatencyMs;
   self->channels = kDefaultChannels;
   self->eos_drain_ms = kDefaultEosDrainMs;
+  gst_segment_init(&self->segment, GST_FORMAT_TIME);
+  self->segment_received = FALSE;
+  self->output_base_pts_set = FALSE;
+  self->output_base_pts = GST_CLOCK_TIME_NONE;
   self->playout.stop = FALSE;
   self->playout.eos_received = FALSE;
   self->playout.joining = FALSE;
