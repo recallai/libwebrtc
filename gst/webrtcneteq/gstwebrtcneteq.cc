@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 
 #include "api/audio/audio_frame.h"
@@ -31,6 +32,7 @@
 #include "api/neteq/neteq.h"
 #include "api/rtp_headers.h"
 #include "api/units/timestamp.h"
+#include "rtc_base/logging.h"
 
 #ifndef PACKAGE
 #define PACKAGE "gstwebrtcneteq"
@@ -232,11 +234,89 @@ G_DEFINE_TYPE(GstWebrtcNetEq, gst_webrtc_net_eq, GST_TYPE_ELEMENT)
 GST_DEBUG_CATEGORY_STATIC(gst_webrtc_net_eq_debug);
 #define GST_CAT_DEFAULT gst_webrtc_net_eq_debug
 
+namespace {
+
+static GstDebugLevel gst_webrtc_net_eq_debug_level_for_webrtc(
+    webrtc::LoggingSeverity severity) {
+  switch (severity) {
+    case webrtc::LS_ERROR:
+      return GST_LEVEL_ERROR;
+    case webrtc::LS_WARNING:
+      return GST_LEVEL_WARNING;
+    case webrtc::LS_INFO:
+      return GST_LEVEL_INFO;
+    case webrtc::LS_VERBOSE:
+      return GST_LEVEL_LOG;
+    case webrtc::LS_NONE:
+      return GST_LEVEL_NONE;
+  }
+}
+
+static void gst_webrtc_net_eq_trim_log_message(std::string* message) {
+  while (!message->empty() &&
+         (message->back() == '\n' || message->back() == '\r')) {
+    message->pop_back();
+  }
+}
+
+class GstWebrtcNetEqLogSink final : public webrtc::LogSink {
+ public:
+  void OnLogMessage(const webrtc::LogLineRef& line) override {
+    std::string message(line.message());
+    gst_webrtc_net_eq_trim_log_message(&message);
+
+    std::string file(line.filename());
+    gst_debug_log(gst_webrtc_net_eq_debug,
+                  gst_webrtc_net_eq_debug_level_for_webrtc(line.severity()),
+                  file.empty() ? "webrtc" : file.c_str(), "RTC_LOG",
+                  line.line(), nullptr, "webrtc: %s", message.c_str());
+  }
+
+  void OnLogMessage(const std::string& message,
+                    webrtc::LoggingSeverity severity) override {
+    LogString(message, severity);
+  }
+
+  void OnLogMessage(const std::string& message) override {
+    LogString(message, webrtc::LS_INFO);
+  }
+
+ private:
+  static void LogString(const std::string& raw_message,
+                        webrtc::LoggingSeverity severity) {
+    std::string message(raw_message);
+    gst_webrtc_net_eq_trim_log_message(&message);
+
+    gst_debug_log(gst_webrtc_net_eq_debug,
+                  gst_webrtc_net_eq_debug_level_for_webrtc(severity),
+                  "webrtc", "RTC_LOG", 0, nullptr, "webrtc: %s",
+                  message.c_str());
+  }
+};
+
+static GOnce webrtc_log_sink_once = G_ONCE_INIT;
+
+static gpointer gst_webrtc_net_eq_install_webrtc_log_sink_once(gpointer) {
+  auto* sink = new GstWebrtcNetEqLogSink();
+  webrtc::LogMessage::SetLogToStderr(false);
+  webrtc::LogMessage::AddLogToStream(sink, webrtc::LS_INFO);
+  return sink;
+}
+
+static void gst_webrtc_net_eq_install_webrtc_log_sink() {
+  g_once(&webrtc_log_sink_once,
+         gst_webrtc_net_eq_install_webrtc_log_sink_once, nullptr);
+}
+
+}  // namespace
+
 enum {
   PROP_0,
   PROP_LATENCY_MS,
   PROP_MAX_LATENCY_MS,
   PROP_EOS_DRAIN_MS,
+  PROP_NETWORK_STATS,
+  PROP_LIFETIME_STATS,
 };
 
 static GstStaticPadTemplate sink_template =
@@ -654,6 +734,51 @@ static gboolean gst_webrtc_net_eq_push_src_caps(GstWebrtcNetEq* self,
   return pushed;
 }
 
+static double gst_webrtc_net_eq_q14_percent(uint16_t value) {
+  return static_cast<double>(value) * 100.0 / 16384.0;
+}
+
+static gchar* gst_webrtc_net_eq_network_stats_string_locked(
+    GstWebrtcNetEq* self) {
+  if (self->state == nullptr || self->state->neteq == nullptr) {
+    return g_strdup("uninitialized");
+  }
+
+  const webrtc::NetEqNetworkStatistics stats =
+      self->state->neteq->CurrentNetworkStatistics();
+  return g_strdup_printf(
+      "buf=%ums pref=%ums peak=%u expand=%.1f%% speech=%.1f%% "
+      "pre=%.1f%% acc=%.1f%%",
+      stats.current_buffer_size_ms, stats.preferred_buffer_size_ms,
+      stats.jitter_peaks_found,
+      gst_webrtc_net_eq_q14_percent(stats.expand_rate),
+      gst_webrtc_net_eq_q14_percent(stats.speech_expand_rate),
+      gst_webrtc_net_eq_q14_percent(stats.preemptive_rate),
+      gst_webrtc_net_eq_q14_percent(stats.accelerate_rate));
+}
+
+static gchar* gst_webrtc_net_eq_lifetime_stats_string_locked(
+    GstWebrtcNetEq* self) {
+  if (self->state == nullptr || self->state->neteq == nullptr) {
+    return g_strdup("uninitialized");
+  }
+
+  const webrtc::NetEqLifetimeStatistics stats =
+      self->state->neteq->GetLifetimeStatistics();
+  return g_strdup_printf(
+      "rx=%" G_GUINT64_FORMAT " conceal=%" G_GUINT64_FORMAT
+      " ev=%" G_GUINT64_FORMAT " drop=%" G_GUINT64_FORMAT
+      " jb=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+      "ms int=%d/%dms",
+      static_cast<guint64>(stats.total_samples_received),
+      static_cast<guint64>(stats.concealed_samples),
+      static_cast<guint64>(stats.concealment_events),
+      static_cast<guint64>(stats.packets_discarded),
+      static_cast<guint64>(stats.jitter_buffer_delay_ms),
+      static_cast<guint64>(stats.jitter_buffer_emitted_count),
+      stats.interruption_count, stats.total_interruption_duration_ms);
+}
+
 static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
     GstWebrtcNetEq* self,
     webrtc::AudioFrame* frame,
@@ -941,6 +1066,16 @@ static GstFlowReturn gst_webrtc_net_eq_chain(GstPad* pad,
   header.paddingLength = 0;
   header.headerLength = 0;
 
+  if (header.payloadType != self->payload_type) {
+    GST_DEBUG_OBJECT(self,
+                     "Dropping RTP packet with payload type %u, expected %d "
+                     "seq=%u ts=%u ssrc=%u",
+                     header.payloadType, self->payload_type,
+                     header.sequenceNumber, header.timestamp, header.ssrc);
+    gst_rtp_buffer_unmap(&rtp);
+    return GST_FLOW_OK;
+  }
+
   const auto* payload =
       static_cast<const uint8_t*>(gst_rtp_buffer_get_payload(&rtp));
   const guint payload_len = gst_rtp_buffer_get_payload_len(&rtp);
@@ -1064,9 +1199,11 @@ static gboolean gst_webrtc_net_eq_sink_event(GstPad* pad,
       return gst_pad_push_event(self->srcpad, event);
     }
 
-    case GST_EVENT_FLUSH_START:
+    case GST_EVENT_FLUSH_START: {
+      const gboolean pushed = gst_pad_push_event(self->srcpad, event);
       gst_webrtc_net_eq_stop_task(self, FALSE);
-      return gst_pad_push_event(self->srcpad, event);
+      return pushed;
+    }
 
     case GST_EVENT_FLUSH_STOP:
       gst_webrtc_net_eq_stop_task(self, FALSE);
@@ -1177,6 +1314,14 @@ static void gst_webrtc_net_eq_get_property(GObject* object,
     case PROP_EOS_DRAIN_MS:
       g_value_set_int(value, self->eos_drain_ms);
       return;
+    case PROP_NETWORK_STATS:
+      g_value_take_string(
+          value, gst_webrtc_net_eq_network_stats_string_locked(self));
+      return;
+    case PROP_LIFETIME_STATS:
+      g_value_take_string(
+          value, gst_webrtc_net_eq_lifetime_stats_string_locked(self));
+      return;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       return;
@@ -1210,6 +1355,15 @@ static GstStateChangeReturn gst_webrtc_net_eq_change_state(
     GstStateChange transition) {
   auto* self = GST_WEBRTC_NET_EQ(element);
 
+  if (transition == GST_STATE_CHANGE_PLAYING_TO_PAUSED) {
+    gst_webrtc_net_eq_stop_task(self, FALSE);
+    {
+      GMutexLock lock(&self->lock);
+      self->playout.stop = FALSE;
+      g_cond_broadcast(&self->cond);
+    }
+  }
+
   if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
     gst_webrtc_net_eq_stop_task(self, FALSE);
     {
@@ -1225,6 +1379,10 @@ static GstStateChangeReturn gst_webrtc_net_eq_change_state(
 static void gst_webrtc_net_eq_class_init(GstWebrtcNetEqClass* klass) {
   auto* gobject_class = G_OBJECT_CLASS(klass);
   auto* element_class = GST_ELEMENT_CLASS(klass);
+
+  GST_DEBUG_CATEGORY_INIT(gst_webrtc_net_eq_debug, "webrtcneteq", 0,
+                          "WebRTC NetEQ GStreamer element");
+  gst_webrtc_net_eq_install_webrtc_log_sink();
 
   gobject_class->set_property = gst_webrtc_net_eq_set_property;
   gobject_class->get_property = gst_webrtc_net_eq_get_property;
@@ -1256,15 +1414,27 @@ static void gst_webrtc_net_eq_class_init(GstWebrtcNetEqClass* klass) {
                        0, 30000, kDefaultEosDrainMs,
                        static_cast<GParamFlags>(G_PARAM_READWRITE |
                                                 G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      gobject_class, PROP_NETWORK_STATS,
+      g_param_spec_string("network-stats", "Network stats",
+                          "Human-readable current NetEQ network statistics",
+                          nullptr,
+                          static_cast<GParamFlags>(G_PARAM_READABLE |
+                                                   G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      gobject_class, PROP_LIFETIME_STATS,
+      g_param_spec_string("lifetime-stats", "Lifetime stats",
+                          "Human-readable cumulative NetEQ lifetime "
+                          "statistics",
+                          nullptr,
+                          static_cast<GParamFlags>(G_PARAM_READABLE |
+                                                   G_PARAM_STATIC_STRINGS)));
 
   gst_element_class_set_static_metadata(
       element_class, "WebRTC NetEQ RTP Opus decoder", "Codec/Decoder/Audio",
       "Decodes RTP/Opus through libwebrtc NetEQ", "Recall.ai");
   gst_element_class_add_static_pad_template(element_class, &sink_template);
   gst_element_class_add_static_pad_template(element_class, &src_template);
-
-  GST_DEBUG_CATEGORY_INIT(gst_webrtc_net_eq_debug, "webrtcneteq", 0,
-                          "WebRTC NetEQ GStreamer element");
 }
 
 static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {

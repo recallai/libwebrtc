@@ -75,6 +75,7 @@ rtc_shared_library("webrtcneteq") {
     "//api/neteq:neteq_api",
     "//api/units:timestamp",
     "//rtc_base:checks",
+    "//rtc_base:logging",
     "//third_party/abseil-cpp/absl/types:optional",
   ]
 }
