@@ -10,7 +10,8 @@ declare_args() {
   gst_webrtcneteq_pkg_config = "pkg-config"
 
   # Homebrew GStreamer on this mac is built with LC_BUILD_VERSION macos 15.0.
-  # Linux builds do not use this.
+  # Linux builds do not use this. The release workflow overrides this when it
+  # builds against the pinned GStreamer SDK.
   gst_webrtcneteq_mac_deployment_target = "15.0"
 }
 

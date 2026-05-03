@@ -98,9 +98,23 @@ jobs:
   macos:
     name: macOS
     runs-on: macos-14
+    env:
+      GSTREAMER_ROOT: /Library/Frameworks/GStreamer.framework/Versions/1.0
+      GSTREAMER_VERSION: 1.20.7
     steps:
-      - name: Install host packages
-        run: brew install pkg-config gstreamer gst-plugins-base
+      - name: Install pinned GStreamer SDK
+        run: |
+          set -eux
+          curl -fL \
+            "https://gstreamer.freedesktop.org/data/pkg/osx/${GSTREAMER_VERSION}/gstreamer-1.0-${GSTREAMER_VERSION}-universal.pkg" \
+            -o "${RUNNER_TEMP}/gstreamer-runtime.pkg"
+          curl -fL \
+            "https://gstreamer.freedesktop.org/data/pkg/osx/${GSTREAMER_VERSION}/gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg" \
+            -o "${RUNNER_TEMP}/gstreamer-devel.pkg"
+          sudo installer -pkg "${RUNNER_TEMP}/gstreamer-runtime.pkg" -target /
+          sudo installer -pkg "${RUNNER_TEMP}/gstreamer-devel.pkg" -target /
+          "${GSTREAMER_ROOT}/bin/pkg-config" --modversion gstreamer-1.0
+          "${GSTREAMER_ROOT}/bin/gst-inspect-1.0" --version
 
       - name: Clone source and sync WebRTC deps
         env:
@@ -133,14 +147,20 @@ jobs:
       - name: Build plugin
         working-directory: ${{ runner.temp }}/webrtcneteq-release/src
         run: |
-          export PATH="${RUNNER_TEMP}/webrtcneteq-release/depot_tools:${PATH}"
-          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false'
+          export PATH="${GSTREAMER_ROOT}/bin:${RUNNER_TEMP}/webrtcneteq-release/depot_tools:${PATH}"
+          export PKG_CONFIG_PATH="${GSTREAMER_ROOT}/lib/pkgconfig"
+          export DYLD_LIBRARY_PATH="${GSTREAMER_ROOT}/lib:${DYLD_LIBRARY_PATH:-}"
+          export DYLD_FRAMEWORK_PATH="/Library/Frameworks:${DYLD_FRAMEWORK_PATH:-}"
+          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false gst_webrtcneteq_mac_deployment_target="11.0"'
           autoninja -C out/webrtcneteq-release :gst_webrtcneteq
 
       - name: Smoke test plugin load
         working-directory: ${{ runner.temp }}/webrtcneteq-release/src
-        run: GST_PLUGIN_PATH="$PWD/out/webrtcneteq-release" gst-inspect-1.0 webrtcneteq
+        run: |
+          export PATH="${GSTREAMER_ROOT}/bin:${PATH}"
+          export DYLD_LIBRARY_PATH="${GSTREAMER_ROOT}/lib:${DYLD_LIBRARY_PATH:-}"
+          export DYLD_FRAMEWORK_PATH="/Library/Frameworks:${DYLD_FRAMEWORK_PATH:-}"
+          GST_PLUGIN_PATH="$PWD/out/webrtcneteq-release" gst-inspect-1.0 webrtcneteq
 
       - name: Package plugin
         working-directory: ${{ runner.temp }}/webrtcneteq-release/src
