@@ -26,6 +26,12 @@ def parse_flags(flags, result, *, for_link):
         result["ldflags"].append(flag)
       else:
         result["cflags"].append(flag)
+    elif flag.startswith("-Wl,-rpath,"):
+      # Homebrew and the GStreamer framework emit absolute rpaths. They make the
+      # plugin non-relocatable, so keep only loader-relative rpaths from pkg-config.
+      rpath = flag[len("-Wl,-rpath,"):]
+      if rpath.startswith("@"):
+        result["ldflags" if for_link else "cflags"].append(flag)
     elif flag.startswith("-Wl,") or flag.startswith("-F"):
       result["ldflags" if for_link else "cflags"].append(flag)
     else:

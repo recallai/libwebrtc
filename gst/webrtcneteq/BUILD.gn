@@ -36,7 +36,9 @@ if (is_linux || is_chromeos) {
 
     if (is_mac) {
       ldflags += [
+        "-Wl,-headerpad_max_install_names",
         "-mmacos-version-min=$gst_webrtcneteq_mac_deployment_target",
+        "-Wl,-rpath,@loader_path/..",
       ]
     }
   }
