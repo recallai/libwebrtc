@@ -191,7 +191,7 @@ jobs:
           export PKG_CONFIG_PATH="${GSTREAMER_ROOT}/lib/pkgconfig"
           export DYLD_LIBRARY_PATH="${GSTREAMER_ROOT}/lib:${DYLD_LIBRARY_PATH:-}"
           export DYLD_FRAMEWORK_PATH="/Library/Frameworks:${DYLD_FRAMEWORK_PATH:-}"
-          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false treat_warnings_as_errors=false use_siso=false use_clang_modules=false gst_webrtcneteq_mac_deployment_target="11.0"'
+          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false treat_warnings_as_errors=false use_siso=false use_clang_modules=false gst_webrtcneteq_mac_deployment_target="12.0"'
           ninja -C out/webrtcneteq-release :gst_webrtcneteq
 
       - name: Smoke test plugin load
