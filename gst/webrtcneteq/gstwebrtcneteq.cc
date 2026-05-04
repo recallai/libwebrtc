@@ -184,6 +184,7 @@ struct _GstWebrtcNetEq {
 
   GstSegment segment;
   gboolean segment_received;
+  gboolean output_segment_sent;
   gboolean output_base_pts_set;
   GstClockTime output_base_pts;
 
@@ -328,6 +329,12 @@ static GstStaticPadTemplate sink_template =
                                             "encoding-name = (string) OPUS, "
                                             "clock-rate = (int) [ 8000, 48000 ], "
                                             "encoding-params = (string) { 1, 2 }, "
+                                            "payload = (int) [ 0, 127 ]; "
+                                            "application/x-rtp, "
+                                            "media = (string) audio, "
+                                            "encoding-name = (string) OPUS, "
+                                            "clock-rate = (int) [ 8000, 48000 ], "
+                                            "encoding-params = (int) [ 1, 2 ], "
                                             "payload = (int) [ 0, 127 ]"));
 
 static GstStaticPadTemplate src_template =
@@ -388,6 +395,35 @@ static std::optional<GstClockTime> gst_webrtc_net_eq_output_base_pts_locked(
     return self->segment.start;
   }
   return std::nullopt;
+}
+
+static GstEvent* gst_webrtc_net_eq_new_output_segment_event_locked(
+    GstWebrtcNetEq* self) {
+  GstSegment segment;
+  if (self->segment_received && self->segment.format == GST_FORMAT_TIME) {
+    segment = self->segment;
+  } else {
+    gst_segment_init(&segment, GST_FORMAT_TIME);
+  }
+
+  if (!GST_CLOCK_TIME_IS_VALID(segment.start) ||
+      segment.start > self->output_base_pts) {
+    segment.start = self->output_base_pts;
+  }
+  if (GST_CLOCK_TIME_IS_VALID(segment.stop) &&
+      segment.stop < self->output_base_pts) {
+    segment.stop = GST_CLOCK_TIME_NONE;
+  }
+  segment.position = self->output_base_pts;
+
+  GST_DEBUG_OBJECT(self,
+                   "Pushing output segment start=%" GST_TIME_FORMAT
+                   ", position=%" GST_TIME_FORMAT ", stop=%" GST_TIME_FORMAT
+                   " for output base PTS %" GST_TIME_FORMAT,
+                   GST_TIME_ARGS(segment.start), GST_TIME_ARGS(segment.position),
+                   GST_TIME_ARGS(segment.stop),
+                   GST_TIME_ARGS(self->output_base_pts));
+  return gst_event_new_segment(&segment);
 }
 
 static std::optional<GstClockTime> gst_webrtc_net_eq_running_time(
@@ -537,6 +573,7 @@ static void gst_webrtc_net_eq_reset_neteq_state(GstWebrtcNetEq* self) {
 
   self->output_base_pts_set = FALSE;
   self->output_base_pts = GST_CLOCK_TIME_NONE;
+  self->output_segment_sent = FALSE;
   self->current_wait_clock_id = nullptr;
 
   self->playout.stop = FALSE;
@@ -688,9 +725,14 @@ static gboolean gst_webrtc_net_eq_parse_caps(GstWebrtcNetEq* self,
 
   gint channels = 0;
   gint int_encoding_params = 0;
+  guint uint_encoding_params = 0;
   if (gst_structure_get_int(structure, "encoding-params",
                             &int_encoding_params)) {
     channels = int_encoding_params;
+  } else if (gst_structure_get_uint(structure, "encoding-params",
+                                    &uint_encoding_params) &&
+             uint_encoding_params <= static_cast<guint>(G_MAXINT)) {
+    channels = static_cast<gint>(uint_encoding_params);
   } else {
     const gchar* encoding_params =
         gst_structure_get_string(structure, "encoding-params");
@@ -885,6 +927,7 @@ static gboolean gst_webrtc_net_eq_pull_locked(GstWebrtcNetEq* self,
 
 static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
   GstClockTime output_base_pts;
+  GstEvent* output_segment_event = nullptr;
   {
     GMutexLock lock(&self->lock);
     if (!self->output_base_pts_set) {
@@ -892,6 +935,16 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
       return;
     }
     output_base_pts = self->output_base_pts;
+    if (!self->output_segment_sent) {
+      output_segment_event =
+          gst_webrtc_net_eq_new_output_segment_event_locked(self);
+      self->output_segment_sent = TRUE;
+    }
+  }
+  if (output_segment_event != nullptr &&
+      !gst_pad_push_event(self->srcpad, output_segment_event)) {
+    GST_WARNING_OBJECT(self, "Failed to push output segment");
+    return;
   }
   guint64 output_samples = 0;
   std::optional<GstClockTime> running_time =
@@ -1189,6 +1242,7 @@ static gboolean gst_webrtc_net_eq_sink_event(GstPad* pad,
         if (segment.format == GST_FORMAT_TIME) {
           self->segment = segment;
           self->segment_received = TRUE;
+          self->output_segment_sent = FALSE;
           self->output_base_pts_set = FALSE;
           self->output_base_pts = GST_CLOCK_TIME_NONE;
         } else {
@@ -1196,7 +1250,8 @@ static gboolean gst_webrtc_net_eq_sink_event(GstPad* pad,
           self->segment_received = FALSE;
         }
       }
-      return gst_pad_push_event(self->srcpad, event);
+      gst_event_unref(event);
+      return TRUE;
     }
 
     case GST_EVENT_FLUSH_START: {
@@ -1463,6 +1518,7 @@ static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {
   self->configured = FALSE;
   gst_segment_init(&self->segment, GST_FORMAT_TIME);
   self->segment_received = FALSE;
+  self->output_segment_sent = FALSE;
   self->output_base_pts_set = FALSE;
   self->output_base_pts = GST_CLOCK_TIME_NONE;
   self->playout.stop = FALSE;
