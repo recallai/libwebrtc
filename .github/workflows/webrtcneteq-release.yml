@@ -113,6 +113,7 @@ jobs:
             -o "${RUNNER_TEMP}/gstreamer-devel.pkg"
           sudo installer -pkg "${RUNNER_TEMP}/gstreamer-runtime.pkg" -target /
           sudo installer -pkg "${RUNNER_TEMP}/gstreamer-devel.pkg" -target /
+          export PKG_CONFIG_PATH="${GSTREAMER_ROOT}/lib/pkgconfig"
           "${GSTREAMER_ROOT}/bin/pkg-config" --modversion gstreamer-1.0
           "${GSTREAMER_ROOT}/bin/gst-inspect-1.0" --version
 
