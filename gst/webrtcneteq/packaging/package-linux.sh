@@ -20,15 +20,16 @@ if [[ ! -f "${plugin}" ]]; then
   exit 1
 fi
 
-deb_arch="$(dpkg --print-architecture)"
-multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+deb_arch="${DEB_ARCH:-$(dpkg --print-architecture)}"
+multiarch="${DEB_HOST_MULTIARCH:-$(dpkg-architecture -a "${deb_arch}" -qDEB_HOST_MULTIARCH)}"
+strip_tool="${STRIP:-strip}"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 
 install_dir="usr/lib/${multiarch}/gstreamer-1.0"
 mkdir -p "${work_dir}/pkg/${install_dir}" "${work_dir}/pkg/DEBIAN" "${dist_dir}"
 cp "${plugin}" "${work_dir}/pkg/${install_dir}/libgstwebrtcneteq.so"
-strip --strip-unneeded "${work_dir}/pkg/${install_dir}/libgstwebrtcneteq.so" || true
+"${strip_tool}" --strip-unneeded "${work_dir}/pkg/${install_dir}/libgstwebrtcneteq.so" || true
 
 raw_so="${dist_dir}/${package_name}-${tag_name}-linux-${deb_arch}.so"
 cp "${work_dir}/pkg/${install_dir}/libgstwebrtcneteq.so" "${raw_so}"

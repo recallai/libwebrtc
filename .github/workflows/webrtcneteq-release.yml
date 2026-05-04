@@ -11,19 +11,26 @@ permissions:
 jobs:
   linux:
     name: Linux ${{ matrix.deb_arch }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     container: debian:bookworm
     strategy:
       fail-fast: false
       matrix:
         include:
           - deb_arch: amd64
-            runner: ubuntu-24.04
+            target_cpu: x64
+            strip: strip
+            smoke_test: true
           - deb_arch: arm64
-            runner: ubuntu-24.04-arm
+            target_cpu: arm64
+            strip: aarch64-linux-gnu-strip
+            smoke_test: false
     steps:
       - name: Install host packages
         run: |
+          if [ "${{ matrix.deb_arch }}" = "arm64" ]; then
+            dpkg --add-architecture arm64
+          fi
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates \
@@ -32,13 +39,23 @@ jobs:
             file \
             git \
             gstreamer1.0-tools \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer1.0-dev \
             lsb-release \
             pkg-config \
             python3 \
             sudo \
             xz-utils
+          if [ "${{ matrix.deb_arch }}" = "arm64" ]; then
+            apt-get install -y --no-install-recommends \
+              binutils-aarch64-linux-gnu \
+              g++-aarch64-linux-gnu \
+              gcc-aarch64-linux-gnu \
+              libgstreamer-plugins-base1.0-dev:arm64 \
+              libgstreamer1.0-dev:arm64
+          else
+            apt-get install -y --no-install-recommends \
+              libgstreamer-plugins-base1.0-dev \
+              libgstreamer1.0-dev
+          fi
 
       - name: Clone source and sync WebRTC deps
         env:
@@ -74,19 +91,41 @@ jobs:
       - name: Build plugin
         working-directory: /work/src
         run: |
+          set -eux
           export PATH="/work/depot_tools:${PATH}"
-          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false use_sysroot=false'
-          autoninja -C out/webrtcneteq-release :gst_webrtcneteq
+          gn_args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false use_sysroot=false use_siso=false'
+          if [ "${{ matrix.deb_arch }}" = "arm64" ]; then
+            cat > /tmp/aarch64-linux-gnu-pkg-config <<'EOF'
+          #!/bin/sh
+          export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          unset PKG_CONFIG_PATH
+          exec pkg-config "$@"
+          EOF
+            chmod +x /tmp/aarch64-linux-gnu-pkg-config
+            gn_args="${gn_args} target_cpu=\"${{ matrix.target_cpu }}\" pkg_config=\"/tmp/aarch64-linux-gnu-pkg-config\""
+          fi
+          gn gen out/webrtcneteq-release --args="${gn_args}"
+          ninja -C out/webrtcneteq-release :gst_webrtcneteq
 
       - name: Smoke test plugin load
+        if: matrix.smoke_test
         working-directory: /work/src
         run: GST_PLUGIN_PATH="$PWD/out/webrtcneteq-release" gst-inspect-1.0 webrtcneteq
+
+      - name: Inspect cross-built plugin
+        if: ${{ !matrix.smoke_test }}
+        working-directory: /work/src
+        run: |
+          file out/webrtcneteq-release/libgstwebrtcneteq.so
+          aarch64-linux-gnu-readelf -h out/webrtcneteq-release/libgstwebrtcneteq.so
 
       - name: Package plugin
         working-directory: /work/src
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          STRIP: ${{ matrix.strip }}
         run: bash gst/webrtcneteq/packaging/package-linux.sh "${GITHUB_REF_NAME}" "${GITHUB_WORKSPACE}/dist/linux-${{ matrix.deb_arch }}"
 
       - name: Upload Linux artifacts
@@ -152,8 +191,8 @@ jobs:
           export PKG_CONFIG_PATH="${GSTREAMER_ROOT}/lib/pkgconfig"
           export DYLD_LIBRARY_PATH="${GSTREAMER_ROOT}/lib:${DYLD_LIBRARY_PATH:-}"
           export DYLD_FRAMEWORK_PATH="/Library/Frameworks:${DYLD_FRAMEWORK_PATH:-}"
-          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false gst_webrtcneteq_mac_deployment_target="11.0"'
-          autoninja -C out/webrtcneteq-release :gst_webrtcneteq
+          gn gen out/webrtcneteq-release --args='is_debug=false rtc_include_tests=false treat_warnings_as_errors=false use_siso=false gst_webrtcneteq_mac_deployment_target="11.0"'
+          ninja -C out/webrtcneteq-release :gst_webrtcneteq
 
       - name: Smoke test plugin load
         working-directory: ${{ runner.temp }}/webrtcneteq-release/src
