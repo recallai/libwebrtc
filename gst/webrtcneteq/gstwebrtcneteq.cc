@@ -52,6 +52,36 @@ constexpr guint kMaxOutputBufferBytes =
     (kMaxClockRateHz * kOutputFrameMs / 1000) * kMaxOutputChannels *
     sizeof(int16_t);
 
+typedef enum {
+  GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE,
+  GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_GLOBAL,
+  GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT,
+} GstWebrtcNetEqBufferPoolMode;
+
+static GType gst_webrtc_net_eq_buffer_pool_mode_get_type() {
+  static gsize type_id = 0;
+
+  if (g_once_init_enter(&type_id)) {
+    static const GEnumValue values[] = {
+        {GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE,
+         "GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE", "none"},
+        {GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_GLOBAL,
+         "GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_GLOBAL", "global"},
+        {GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT,
+         "GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT", "per-element"},
+        {0, nullptr, nullptr},
+    };
+    const GType id =
+        g_enum_register_static("GstWebrtcNetEqBufferPoolMode", values);
+    g_once_init_leave(&type_id, id);
+  }
+
+  return static_cast<GType>(type_id);
+}
+
+#define GST_TYPE_WEBRTC_NET_EQ_BUFFER_POOL_MODE \
+  (gst_webrtc_net_eq_buffer_pool_mode_get_type())
+
 struct NetEqState {
   explicit NetEqState(webrtc::Environment environment)
       : env(std::move(environment)) {}
@@ -135,25 +165,10 @@ static gpointer gst_webrtc_net_eq_init_output_buffer_pool(gpointer) {
   return pool;
 }
 
-static GstBufferPool* gst_webrtc_net_eq_output_buffer_pool() {
+static GstBufferPool* gst_webrtc_net_eq_global_output_buffer_pool() {
   return static_cast<GstBufferPool*>(
       g_once(&output_buffer_pool_once,
              gst_webrtc_net_eq_init_output_buffer_pool, nullptr));
-}
-
-static GstBuffer* gst_webrtc_net_eq_new_output_buffer(size_t output_size) {
-  GstBufferPool* pool = gst_webrtc_net_eq_output_buffer_pool();
-  if (pool != nullptr && output_size <= kMaxOutputBufferBytes) {
-    GstBuffer* buffer = nullptr;
-    const GstFlowReturn flow =
-        gst_buffer_pool_acquire_buffer(pool, &buffer, nullptr);
-    if (flow == GST_FLOW_OK && buffer != nullptr) {
-      gst_buffer_resize(buffer, 0, output_size);
-      return buffer;
-    }
-  }
-
-  return gst_buffer_new_allocate(nullptr, output_size, nullptr);
 }
 
 }  // namespace
@@ -180,6 +195,8 @@ struct _GstWebrtcNetEq {
   gint max_latency_ms;
   gint channels;
   gint eos_drain_ms;
+  GstWebrtcNetEqBufferPoolMode buffer_pool_mode;
+  GstBufferPool* output_buffer_pool;
   gboolean configured;
 
   GstSegment segment;
@@ -236,6 +253,60 @@ GST_DEBUG_CATEGORY_STATIC(gst_webrtc_net_eq_debug);
 #define GST_CAT_DEFAULT gst_webrtc_net_eq_debug
 
 namespace {
+
+static void gst_webrtc_net_eq_clear_output_buffer_pool(GstWebrtcNetEq* self) {
+  if (self->output_buffer_pool == nullptr) {
+    return;
+  }
+
+  gst_buffer_pool_set_active(self->output_buffer_pool, FALSE);
+  gst_object_unref(self->output_buffer_pool);
+  self->output_buffer_pool = nullptr;
+}
+
+static GstBufferPool* gst_webrtc_net_eq_element_output_buffer_pool(
+    GstWebrtcNetEq* self) {
+  if (self->output_buffer_pool != nullptr) {
+    return self->output_buffer_pool;
+  }
+
+  self->output_buffer_pool = static_cast<GstBufferPool*>(
+      gst_webrtc_net_eq_init_output_buffer_pool(nullptr));
+  if (self->output_buffer_pool == nullptr) {
+    GST_WARNING_OBJECT(self, "Failed to create per-element output buffer pool");
+  }
+  return self->output_buffer_pool;
+}
+
+static GstBufferPool* gst_webrtc_net_eq_output_buffer_pool(
+    GstWebrtcNetEq* self) {
+  switch (self->buffer_pool_mode) {
+    case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE:
+      return nullptr;
+    case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_GLOBAL:
+      return gst_webrtc_net_eq_global_output_buffer_pool();
+    case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT:
+      return gst_webrtc_net_eq_element_output_buffer_pool(self);
+  }
+
+  return nullptr;
+}
+
+static GstBuffer* gst_webrtc_net_eq_new_output_buffer(GstWebrtcNetEq* self,
+                                                      size_t output_size) {
+  GstBufferPool* pool = gst_webrtc_net_eq_output_buffer_pool(self);
+  if (pool != nullptr && output_size <= kMaxOutputBufferBytes) {
+    GstBuffer* buffer = nullptr;
+    const GstFlowReturn flow =
+        gst_buffer_pool_acquire_buffer(pool, &buffer, nullptr);
+    if (flow == GST_FLOW_OK && buffer != nullptr) {
+      gst_buffer_resize(buffer, 0, output_size);
+      return buffer;
+    }
+  }
+
+  return gst_buffer_new_allocate(nullptr, output_size, nullptr);
+}
 
 static GstDebugLevel gst_webrtc_net_eq_debug_level_for_webrtc(
     webrtc::LoggingSeverity severity) {
@@ -316,6 +387,7 @@ enum {
   PROP_LATENCY_MS,
   PROP_MAX_LATENCY_MS,
   PROP_EOS_DRAIN_MS,
+  PROP_BUFFER_POOL_MODE,
   PROP_NETWORK_STATS,
   PROP_LIFETIME_STATS,
 };
@@ -570,6 +642,7 @@ static void gst_webrtc_net_eq_stop_task(GstWebrtcNetEq* self,
 static void gst_webrtc_net_eq_reset_neteq_state(GstWebrtcNetEq* self) {
   delete self->state;
   self->state = nullptr;
+  gst_webrtc_net_eq_clear_output_buffer_pool(self);
 
   self->output_base_pts_set = FALSE;
   self->output_base_pts = GST_CLOCK_TIME_NONE;
@@ -858,7 +931,7 @@ static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
   const size_t sample_count = samples_per_channel * channels;
   const size_t output_size = sample_count * sizeof(int16_t);
 
-  GstBufferPtr output(gst_webrtc_net_eq_new_output_buffer(output_size));
+  GstBufferPtr output(gst_webrtc_net_eq_new_output_buffer(self, output_size));
   if (!output) {
     return GST_FLOW_ERROR;
   }
@@ -1346,6 +1419,16 @@ static void gst_webrtc_net_eq_set_property(GObject* object,
       self->eos_drain_ms = g_value_get_int(value);
       return;
     }
+    case PROP_BUFFER_POOL_MODE: {
+      GMutexLock lock(&self->lock);
+      const auto buffer_pool_mode = static_cast<GstWebrtcNetEqBufferPoolMode>(
+          g_value_get_enum(value));
+      if (self->buffer_pool_mode != buffer_pool_mode) {
+        self->buffer_pool_mode = buffer_pool_mode;
+        gst_webrtc_net_eq_clear_output_buffer_pool(self);
+      }
+      return;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       return;
@@ -1368,6 +1451,9 @@ static void gst_webrtc_net_eq_get_property(GObject* object,
       return;
     case PROP_EOS_DRAIN_MS:
       g_value_set_int(value, self->eos_drain_ms);
+      return;
+    case PROP_BUFFER_POOL_MODE:
+      g_value_set_enum(value, self->buffer_pool_mode);
       return;
     case PROP_NETWORK_STATS:
       g_value_take_string(
@@ -1398,6 +1484,7 @@ static void gst_webrtc_net_eq_finalize(GObject* object) {
     GMutexLock lock(&self->lock);
     delete self->state;
     self->state = nullptr;
+    gst_webrtc_net_eq_clear_output_buffer_pool(self);
   }
   g_cond_clear(&self->cond);
   g_mutex_clear(&self->lock);
@@ -1470,6 +1557,16 @@ static void gst_webrtc_net_eq_class_init(GstWebrtcNetEqClass* klass) {
                        static_cast<GParamFlags>(G_PARAM_READWRITE |
                                                 G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
+      gobject_class, PROP_BUFFER_POOL_MODE,
+      g_param_spec_enum("buffer-pool-mode", "Buffer pool mode",
+                        "Output buffer allocation mode: none, global, or "
+                        "per-element buffer pool",
+                        GST_TYPE_WEBRTC_NET_EQ_BUFFER_POOL_MODE,
+                        GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE |
+                                                 GST_PARAM_MUTABLE_READY |
+                                                 G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
       gobject_class, PROP_NETWORK_STATS,
       g_param_spec_string("network-stats", "Network stats",
                           "Human-readable current NetEQ network statistics",
@@ -1515,6 +1612,8 @@ static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {
   self->max_latency_ms = kDefaultMaxLatencyMs;
   self->channels = 0;
   self->eos_drain_ms = kDefaultEosDrainMs;
+  self->buffer_pool_mode = GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE;
+  self->output_buffer_pool = nullptr;
   self->configured = FALSE;
   gst_segment_init(&self->segment, GST_FORMAT_TIME);
   self->segment_received = FALSE;
