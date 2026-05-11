@@ -445,10 +445,9 @@ static std::optional<GstClockTime> gst_webrtc_net_eq_running_time(
   return now - base_time;
 }
 
-static GstClockID gst_webrtc_net_eq_new_periodic_clock_id(
+static GstClockID gst_webrtc_net_eq_new_single_shot_clock_id(
     GstWebrtcNetEq* self,
-    GstClockTime start_running_time,
-    GstClockTime interval) {
+    GstClockTime target_running_time) {
   GstClock* clock = gst_element_get_clock(GST_ELEMENT(self));
   if (clock == nullptr) {
     GST_WARNING_OBJECT(self, "Cannot pace playout without a pipeline clock");
@@ -456,20 +455,19 @@ static GstClockID gst_webrtc_net_eq_new_periodic_clock_id(
   }
 
   const GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(self));
-  if (!GST_CLOCK_TIME_IS_VALID(start_running_time) ||
-      !GST_CLOCK_TIME_IS_VALID(interval) ||
+  if (!GST_CLOCK_TIME_IS_VALID(target_running_time) ||
       !GST_CLOCK_TIME_IS_VALID(base_time) ||
-      G_MAXUINT64 - base_time < start_running_time) {
+      G_MAXUINT64 - base_time < target_running_time) {
     gst_object_unref(clock);
     GST_WARNING_OBJECT(self, "Cannot convert running time to clock time");
     return nullptr;
   }
 
-  GstClockID raw_clock_id = gst_clock_new_periodic_id(
-      clock, base_time + start_running_time, interval);
+  GstClockID raw_clock_id =
+      gst_clock_new_single_shot_id(clock, base_time + target_running_time);
   gst_object_unref(clock);
   if (raw_clock_id == nullptr) {
-    GST_WARNING_OBJECT(self, "Cannot create periodic clock ID");
+    GST_WARNING_OBJECT(self, "Cannot create single-shot clock ID");
   }
   return raw_clock_id;
 }
@@ -505,38 +503,30 @@ static ClockWaitResult gst_webrtc_net_eq_wait_on_clock_id(
   return ClockWaitResult::kError;
 }
 
-static GstClockID gst_webrtc_net_eq_start_periodic_wait_locked(
+static ClockWaitResult gst_webrtc_net_eq_wait_until_running_time(
     GstWebrtcNetEq* self,
-    GstClockTime start_running_time,
-    GstClockTime interval) {
-  GstClockID raw_clock_id = gst_webrtc_net_eq_new_periodic_clock_id(
-      self, start_running_time, interval);
+    GstClockTime target_running_time,
+    gboolean stop_on_stop) {
+  // Reusing a periodic clock ID with synchronous gst_clock_id_wait() leaves
+  // late ticks in GST_CLOCK_EARLY, which GStreamer logs as an unexpected
+  // status on the next wait. Use fresh single-shot IDs for each playout tick.
+  GstClockID raw_clock_id =
+      gst_webrtc_net_eq_new_single_shot_clock_id(self, target_running_time);
   if (raw_clock_id == nullptr) {
-    return nullptr;
+    return ClockWaitResult::kError;
   }
 
-  if (self->playout.stop && !self->playout.eos_received) {
-    gst_clock_id_unref(raw_clock_id);
-    return nullptr;
-  }
-  self->current_wait_clock_id = raw_clock_id;
-  return raw_clock_id;
-}
-
-static GstClockID gst_webrtc_net_eq_start_periodic_wait_from_now(
-    GstWebrtcNetEq* self,
-    GstClockTime delay,
-    GstClockTime interval) {
-  const std::optional<GstClockTime> running_time =
-      gst_webrtc_net_eq_running_time(self);
-  if (!running_time.has_value() || G_MAXUINT64 - *running_time < delay) {
-    GST_WARNING_OBJECT(self, "Cannot schedule periodic clock ID");
-    return nullptr;
+  {
+    GMutexLock lock(&self->lock);
+    if (stop_on_stop && self->playout.stop) {
+      gst_clock_id_unref(raw_clock_id);
+      return ClockWaitResult::kStopped;
+    }
+    self->current_wait_clock_id = raw_clock_id;
   }
 
-  GMutexLock lock(&self->lock);
-  return gst_webrtc_net_eq_start_periodic_wait_locked(
-      self, *running_time + delay, interval);
+  PlayoutClockIdScope clock_id(self, raw_clock_id);
+  return gst_webrtc_net_eq_wait_on_clock_id(self, clock_id.get(), stop_on_stop);
 }
 
 static void gst_webrtc_net_eq_stop_task(GstWebrtcNetEq* self,
@@ -956,44 +946,41 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
   const GstClockTime output_frame_duration = kOutputFrameMs * GST_MSECOND;
   webrtc::AudioFrame frame;
 
-  GstClockID raw_clock_id = nullptr;
-  {
-    GMutexLock lock(&self->lock);
-    raw_clock_id = gst_webrtc_net_eq_start_periodic_wait_locked(
-        self, *running_time, output_frame_duration);
-    if (raw_clock_id == nullptr) {
+  GstClockTime next_output_running_time = *running_time;
+
+  while (true) {
+    const ClockWaitResult wait_result =
+        gst_webrtc_net_eq_wait_until_running_time(
+            self, next_output_running_time, TRUE);
+    if (wait_result == ClockWaitResult::kStopped) {
+      break;
+    }
+    if (wait_result == ClockWaitResult::kError) {
       return;
     }
-  }
 
-  {
-    PlayoutClockIdScope clock_id(self, raw_clock_id);
-    while (true) {
-      const ClockWaitResult wait_result =
-          gst_webrtc_net_eq_wait_on_clock_id(self, clock_id.get(), TRUE);
-      if (wait_result == ClockWaitResult::kStopped) {
+    GstBuffer* raw_buffer = nullptr;
+
+    {
+      GMutexLock lock(&self->lock);
+      if (self->playout.stop) {
         break;
       }
-      if (wait_result == ClockWaitResult::kError) {
+      if (!gst_webrtc_net_eq_pull_locked(self, &frame, output_base_pts,
+                                         &output_samples, &raw_buffer)) {
         return;
       }
+    }
 
-      GstBuffer* raw_buffer = nullptr;
+    if (!gst_webrtc_net_eq_push_buffer(self, raw_buffer)) {
+      return;
+    }
 
-      {
-        GMutexLock lock(&self->lock);
-        if (self->playout.stop) {
-          break;
-        }
-        if (!gst_webrtc_net_eq_pull_locked(self, &frame, output_base_pts,
-                                           &output_samples, &raw_buffer)) {
-          return;
-        }
-      }
-
-      if (!gst_webrtc_net_eq_push_buffer(self, raw_buffer)) {
-        return;
-      }
+    next_output_running_time = gst_webrtc_net_eq_add_time(
+        next_output_running_time, output_frame_duration);
+    if (!GST_CLOCK_TIME_IS_VALID(next_output_running_time)) {
+      GST_WARNING_OBJECT(self, "Cannot schedule next playout clock tick");
+      return;
     }
   }
 
@@ -1020,16 +1007,22 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
     return;
   }
 
-  raw_clock_id = gst_webrtc_net_eq_start_periodic_wait_from_now(
-      self, output_frame_duration, output_frame_duration);
-  if (raw_clock_id == nullptr) {
+  running_time = gst_webrtc_net_eq_running_time(self);
+  if (!running_time.has_value()) {
+    GST_ERROR_OBJECT(self, "Cannot drain EOS without a pipeline clock");
     return;
   }
-  PlayoutClockIdScope drain_clock_id(self, raw_clock_id);
+  GstClockTime next_drain_running_time =
+      gst_webrtc_net_eq_add_time(*running_time, output_frame_duration);
+  if (!GST_CLOCK_TIME_IS_VALID(next_drain_running_time)) {
+    GST_WARNING_OBJECT(self, "Cannot schedule EOS drain clock tick");
+    return;
+  }
 
   for (guint i = 0; i < eos_drain_pulls; ++i) {
     const ClockWaitResult wait_result =
-        gst_webrtc_net_eq_wait_on_clock_id(self, drain_clock_id.get(), FALSE);
+        gst_webrtc_net_eq_wait_until_running_time(self, next_drain_running_time,
+                                                  FALSE);
     if (wait_result == ClockWaitResult::kError) {
       return;
     }
@@ -1045,6 +1038,13 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
     }
 
     if (!gst_webrtc_net_eq_push_buffer(self, raw_buffer)) {
+      return;
+    }
+
+    next_drain_running_time = gst_webrtc_net_eq_add_time(
+        next_drain_running_time, output_frame_duration);
+    if (!GST_CLOCK_TIME_IS_VALID(next_drain_running_time)) {
+      GST_WARNING_OBJECT(self, "Cannot schedule next EOS drain clock tick");
       return;
     }
   }
