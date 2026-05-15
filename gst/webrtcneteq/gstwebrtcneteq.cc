@@ -46,10 +46,13 @@ constexpr int kDefaultEosDrainMs = 1000;
 constexpr int kMaxNetEqDelayMs = 10000;
 constexpr int kMinClockRateHz = 8000;
 constexpr int kMaxClockRateHz = 48000;
-constexpr int kOutputFrameMs = 10;
+constexpr int kNetEqPullFrameMs = 10;
+constexpr int kDefaultOutputFrameMs = 20;
+constexpr int kMinOutputFrameMs = kNetEqPullFrameMs;
+constexpr int kMaxOutputFrameMs = 100;
 constexpr guint kMaxOutputChannels = 2;
 constexpr guint kMaxOutputBufferBytes =
-    (kMaxClockRateHz * kOutputFrameMs / 1000) * kMaxOutputChannels *
+    (kMaxClockRateHz * kMaxOutputFrameMs / 1000) * kMaxOutputChannels *
     sizeof(int16_t);
 
 typedef enum {
@@ -143,15 +146,15 @@ class GstBufferPtr {
 
 static GOnce output_buffer_pool_once = G_ONCE_INIT;
 
-static gpointer gst_webrtc_net_eq_init_output_buffer_pool(gpointer) {
+static GstBufferPool* gst_webrtc_net_eq_new_output_buffer_pool(
+    guint buffer_size) {
   GstBufferPool* pool = gst_buffer_pool_new();
   if (pool == nullptr) {
     return nullptr;
   }
 
   GstStructure* config = gst_buffer_pool_get_config(pool);
-  gst_buffer_pool_config_set_params(config, nullptr, kMaxOutputBufferBytes, 0,
-                                    0);
+  gst_buffer_pool_config_set_params(config, nullptr, buffer_size, 0, 0);
   if (!gst_buffer_pool_set_config(pool, config)) {
     gst_object_unref(pool);
     return nullptr;
@@ -165,10 +168,14 @@ static gpointer gst_webrtc_net_eq_init_output_buffer_pool(gpointer) {
   return pool;
 }
 
+static gpointer gst_webrtc_net_eq_init_global_output_buffer_pool(gpointer) {
+  return gst_webrtc_net_eq_new_output_buffer_pool(kMaxOutputBufferBytes);
+}
+
 static GstBufferPool* gst_webrtc_net_eq_global_output_buffer_pool() {
   return static_cast<GstBufferPool*>(
       g_once(&output_buffer_pool_once,
-             gst_webrtc_net_eq_init_output_buffer_pool, nullptr));
+             gst_webrtc_net_eq_init_global_output_buffer_pool, nullptr));
 }
 
 }  // namespace
@@ -195,8 +202,10 @@ struct _GstWebrtcNetEq {
   gint max_latency_ms;
   gint channels;
   gint eos_drain_ms;
+  gint output_frame_ms;
   GstWebrtcNetEqBufferPoolMode buffer_pool_mode;
   GstBufferPool* output_buffer_pool;
+  guint output_buffer_pool_size;
   gboolean configured;
 
   GstSegment segment;
@@ -262,31 +271,62 @@ static void gst_webrtc_net_eq_clear_output_buffer_pool(GstWebrtcNetEq* self) {
   gst_buffer_pool_set_active(self->output_buffer_pool, FALSE);
   gst_object_unref(self->output_buffer_pool);
   self->output_buffer_pool = nullptr;
+  self->output_buffer_pool_size = 0;
+}
+
+static guint gst_webrtc_net_eq_expected_output_buffer_size_locked(
+    GstWebrtcNetEq* self) {
+  if (self->clock_rate_hz <= 0 || self->channels <= 0 ||
+      self->output_frame_ms <= 0) {
+    return kMaxOutputBufferBytes;
+  }
+
+  const guint64 samples_per_channel =
+      (static_cast<guint64>(self->clock_rate_hz) * self->output_frame_ms +
+       999) /
+      1000;
+  const guint64 buffer_size =
+      samples_per_channel * self->channels * sizeof(int16_t);
+  if (buffer_size == 0 || buffer_size > kMaxOutputBufferBytes) {
+    return kMaxOutputBufferBytes;
+  }
+
+  return static_cast<guint>(buffer_size);
 }
 
 static GstBufferPool* gst_webrtc_net_eq_element_output_buffer_pool(
-    GstWebrtcNetEq* self) {
+    GstWebrtcNetEq* self,
+    guint* pool_size) {
   if (self->output_buffer_pool != nullptr) {
+    *pool_size = self->output_buffer_pool_size;
     return self->output_buffer_pool;
   }
 
-  self->output_buffer_pool = static_cast<GstBufferPool*>(
-      gst_webrtc_net_eq_init_output_buffer_pool(nullptr));
+  const guint buffer_size =
+      gst_webrtc_net_eq_expected_output_buffer_size_locked(self);
+  self->output_buffer_pool =
+      gst_webrtc_net_eq_new_output_buffer_pool(buffer_size);
   if (self->output_buffer_pool == nullptr) {
     GST_WARNING_OBJECT(self, "Failed to create per-element output buffer pool");
+  } else {
+    self->output_buffer_pool_size = buffer_size;
   }
+  *pool_size = self->output_buffer_pool_size;
   return self->output_buffer_pool;
 }
 
 static GstBufferPool* gst_webrtc_net_eq_output_buffer_pool(
-    GstWebrtcNetEq* self) {
+    GstWebrtcNetEq* self,
+    guint* pool_size) {
+  *pool_size = 0;
   switch (self->buffer_pool_mode) {
     case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE:
       return nullptr;
     case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_GLOBAL:
+      *pool_size = kMaxOutputBufferBytes;
       return gst_webrtc_net_eq_global_output_buffer_pool();
     case GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT:
-      return gst_webrtc_net_eq_element_output_buffer_pool(self);
+      return gst_webrtc_net_eq_element_output_buffer_pool(self, pool_size);
   }
 
   return nullptr;
@@ -294,8 +334,9 @@ static GstBufferPool* gst_webrtc_net_eq_output_buffer_pool(
 
 static GstBuffer* gst_webrtc_net_eq_new_output_buffer(GstWebrtcNetEq* self,
                                                       size_t output_size) {
-  GstBufferPool* pool = gst_webrtc_net_eq_output_buffer_pool(self);
-  if (pool != nullptr && output_size <= kMaxOutputBufferBytes) {
+  guint pool_size = 0;
+  GstBufferPool* pool = gst_webrtc_net_eq_output_buffer_pool(self, &pool_size);
+  if (pool != nullptr && output_size <= pool_size) {
     GstBuffer* buffer = nullptr;
     const GstFlowReturn flow =
         gst_buffer_pool_acquire_buffer(pool, &buffer, nullptr);
@@ -387,6 +428,7 @@ enum {
   PROP_LATENCY_MS,
   PROP_MAX_LATENCY_MS,
   PROP_EOS_DRAIN_MS,
+  PROP_OUTPUT_FRAME_MS,
   PROP_BUFFER_POOL_MODE,
   PROP_NETWORK_STATS,
   PROP_LIFETIME_STATS,
@@ -894,16 +936,19 @@ static gchar* gst_webrtc_net_eq_lifetime_stats_string_locked(
       stats.interruption_count, stats.total_interruption_duration_ms);
 }
 
-static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
+static guint gst_webrtc_net_eq_output_pulls_per_buffer_locked(
+    GstWebrtcNetEq* self) {
+  return std::max<guint>(
+      1, static_cast<guint>(self->output_frame_ms / kNetEqPullFrameMs));
+}
+
+static GstFlowReturn gst_webrtc_net_eq_pull_neteq_frame_locked(
     GstWebrtcNetEq* self,
     webrtc::AudioFrame* frame,
-    GstClockTime output_base_pts,
-    guint64* output_samples,
-    GstBuffer** out_buffer) {
-  bool muted = false;
+    bool* muted) {
   int decoded_rate_hz = 0;
-  const int result = self->state->neteq->GetAudio(frame, &muted,
-                                                  &decoded_rate_hz);
+  const int result =
+      self->state->neteq->GetAudio(frame, muted, &decoded_rate_hz);
   if (result != webrtc::NetEq::kOK) {
     GST_WARNING_OBJECT(self, "NetEQ GetAudio failed");
     return GST_FLOW_ERROR;
@@ -927,7 +972,37 @@ static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
                        channels, self->channels);
     return GST_FLOW_NOT_NEGOTIATED;
   }
-  const size_t samples_per_channel = frame->samples_per_channel();
+  if (frame->samples_per_channel() == 0) {
+    GST_WARNING_OBJECT(self, "NetEQ returned an empty audio frame");
+    return GST_FLOW_ERROR;
+  }
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
+    GstWebrtcNetEq* self,
+    webrtc::AudioFrame* frame,
+    guint pulls,
+    GstClockTime output_base_pts,
+    guint64* output_samples,
+    GstBuffer** out_buffer) {
+  if (pulls == 0) {
+    GST_WARNING_OBJECT(self, "Cannot create audio from zero NetEQ pulls");
+    return GST_FLOW_ERROR;
+  }
+
+  bool muted = false;
+  GstFlowReturn flow =
+      gst_webrtc_net_eq_pull_neteq_frame_locked(self, frame, &muted);
+  if (flow != GST_FLOW_OK) {
+    return flow;
+  }
+
+  const size_t channels = frame->num_channels();
+  const size_t samples_per_pull = frame->samples_per_channel();
+  const size_t bytes_per_pull = samples_per_pull * channels * sizeof(int16_t);
+  const size_t samples_per_channel = samples_per_pull * pulls;
   const size_t sample_count = samples_per_channel * channels;
   const size_t output_size = sample_count * sizeof(int16_t);
 
@@ -941,10 +1016,30 @@ static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
     return GST_FLOW_ERROR;
   }
 
-  if (muted) {
-    std::memset(map.data, 0, output_size);
-  } else {
-    std::memcpy(map.data, frame->data(), output_size);
+  for (guint i = 0; i < pulls; ++i) {
+    if (i != 0) {
+      flow = gst_webrtc_net_eq_pull_neteq_frame_locked(self, frame, &muted);
+      if (flow != GST_FLOW_OK) {
+        gst_buffer_unmap(output.get(), &map);
+        return flow;
+      }
+      if (frame->samples_per_channel() != samples_per_pull) {
+        GST_WARNING_OBJECT(
+            self,
+            "NetEQ output frame size changed from %zu to %zu samples per "
+            "channel within one output buffer",
+            samples_per_pull, frame->samples_per_channel());
+        gst_buffer_unmap(output.get(), &map);
+        return GST_FLOW_ERROR;
+      }
+    }
+
+    guint8* dst = map.data + (i * bytes_per_pull);
+    if (muted) {
+      std::memset(dst, 0, bytes_per_pull);
+    } else {
+      std::memcpy(dst, frame->data(), bytes_per_pull);
+    }
   }
   gst_buffer_unmap(output.get(), &map);
 
@@ -984,13 +1079,14 @@ static gboolean gst_webrtc_net_eq_push_buffer(GstWebrtcNetEq* self,
 
 static gboolean gst_webrtc_net_eq_pull_locked(GstWebrtcNetEq* self,
                                               webrtc::AudioFrame* frame,
+                                              guint pulls,
                                               GstClockTime output_base_pts,
                                               guint64* output_samples,
                                               GstBuffer** out_buffer) {
   *out_buffer = nullptr;
 
   const GstFlowReturn flow = gst_webrtc_net_eq_create_audio_locked(
-      self, frame, output_base_pts, output_samples, out_buffer);
+      self, frame, pulls, output_base_pts, output_samples, out_buffer);
   if (flow != GST_FLOW_OK) {
     return FALSE;
   }
@@ -1026,7 +1122,15 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
     GST_ERROR_OBJECT(self, "Cannot start playout without a pipeline clock");
     return;
   }
-  const GstClockTime output_frame_duration = kOutputFrameMs * GST_MSECOND;
+  gint output_frame_ms;
+  guint pulls_per_output_buffer;
+  {
+    GMutexLock lock(&self->lock);
+    output_frame_ms = self->output_frame_ms;
+    pulls_per_output_buffer =
+        gst_webrtc_net_eq_output_pulls_per_buffer_locked(self);
+  }
+  const GstClockTime output_frame_duration = output_frame_ms * GST_MSECOND;
   webrtc::AudioFrame frame;
 
   GstClockID raw_clock_id = nullptr;
@@ -1058,8 +1162,9 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
         if (self->playout.stop) {
           break;
         }
-        if (!gst_webrtc_net_eq_pull_locked(self, &frame, output_base_pts,
-                                           &output_samples, &raw_buffer)) {
+        if (!gst_webrtc_net_eq_pull_locked(
+                self, &frame, pulls_per_output_buffer, output_base_pts,
+                &output_samples, &raw_buffer)) {
           return;
         }
       }
@@ -1082,8 +1187,8 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
                   .current_buffer_size_ms
             : 0;
     const int drain_ms = std::min(buffered_ms, self->eos_drain_ms);
-    eos_drain_pulls =
-        static_cast<guint>((drain_ms + kOutputFrameMs - 1) / kOutputFrameMs);
+    eos_drain_pulls = static_cast<guint>((drain_ms + kNetEqPullFrameMs - 1) /
+                                         kNetEqPullFrameMs);
     GST_DEBUG_OBJECT(self,
                      "Draining %d ms of buffered NetEQ audio at EOS, capped "
                      "by eos-drain-ms=%d",
@@ -1100,7 +1205,7 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
   }
   PlayoutClockIdScope drain_clock_id(self, raw_clock_id);
 
-  for (guint i = 0; i < eos_drain_pulls; ++i) {
+  for (guint remaining_pulls = eos_drain_pulls; remaining_pulls > 0;) {
     const ClockWaitResult wait_result =
         gst_webrtc_net_eq_wait_on_clock_id(self, drain_clock_id.get(), FALSE);
     if (wait_result == ClockWaitResult::kError) {
@@ -1111,10 +1216,12 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
 
     {
       GMutexLock lock(&self->lock);
-      if (!gst_webrtc_net_eq_pull_locked(self, &frame, output_base_pts,
+      const guint pulls = std::min(remaining_pulls, pulls_per_output_buffer);
+      if (!gst_webrtc_net_eq_pull_locked(self, &frame, pulls, output_base_pts,
                                          &output_samples, &raw_buffer)) {
         return;
       }
+      remaining_pulls -= pulls;
     }
 
     if (!gst_webrtc_net_eq_push_buffer(self, raw_buffer)) {
@@ -1419,6 +1526,23 @@ static void gst_webrtc_net_eq_set_property(GObject* object,
       self->eos_drain_ms = g_value_get_int(value);
       return;
     }
+    case PROP_OUTPUT_FRAME_MS: {
+      GMutexLock lock(&self->lock);
+      const gint output_frame_ms = g_value_get_int(value);
+      if (output_frame_ms % kNetEqPullFrameMs != 0) {
+        GST_WARNING_OBJECT(
+            self,
+            "Ignoring output-frame-ms %d because it is not a multiple of "
+            "%d ms",
+            output_frame_ms, kNetEqPullFrameMs);
+        return;
+      }
+      if (self->output_frame_ms != output_frame_ms) {
+        self->output_frame_ms = output_frame_ms;
+        gst_webrtc_net_eq_clear_output_buffer_pool(self);
+      }
+      return;
+    }
     case PROP_BUFFER_POOL_MODE: {
       GMutexLock lock(&self->lock);
       const auto buffer_pool_mode = static_cast<GstWebrtcNetEqBufferPoolMode>(
@@ -1451,6 +1575,9 @@ static void gst_webrtc_net_eq_get_property(GObject* object,
       return;
     case PROP_EOS_DRAIN_MS:
       g_value_set_int(value, self->eos_drain_ms);
+      return;
+    case PROP_OUTPUT_FRAME_MS:
+      g_value_set_int(value, self->output_frame_ms);
       return;
     case PROP_BUFFER_POOL_MODE:
       g_value_set_enum(value, self->buffer_pool_mode);
@@ -1557,12 +1684,22 @@ static void gst_webrtc_net_eq_class_init(GstWebrtcNetEqClass* klass) {
                        static_cast<GParamFlags>(G_PARAM_READWRITE |
                                                 G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
+      gobject_class, PROP_OUTPUT_FRAME_MS,
+      g_param_spec_int(
+          "output-frame-ms", "Output frame duration",
+          "Duration of each pushed audio buffer in milliseconds; "
+          "must be a multiple of 10 ms because NetEQ is pulled in "
+          "10 ms frames",
+          kMinOutputFrameMs, kMaxOutputFrameMs, kDefaultOutputFrameMs,
+          static_cast<GParamFlags>(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                                   G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
       gobject_class, PROP_BUFFER_POOL_MODE,
       g_param_spec_enum("buffer-pool-mode", "Buffer pool mode",
                         "Output buffer allocation mode: none, global, or "
                         "per-element buffer pool",
                         GST_TYPE_WEBRTC_NET_EQ_BUFFER_POOL_MODE,
-                        GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE,
+                        GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT,
                         static_cast<GParamFlags>(G_PARAM_READWRITE |
                                                  GST_PARAM_MUTABLE_READY |
                                                  G_PARAM_STATIC_STRINGS)));
@@ -1612,8 +1749,10 @@ static void gst_webrtc_net_eq_init(GstWebrtcNetEq* self) {
   self->max_latency_ms = kDefaultMaxLatencyMs;
   self->channels = 0;
   self->eos_drain_ms = kDefaultEosDrainMs;
-  self->buffer_pool_mode = GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_NONE;
+  self->output_frame_ms = kDefaultOutputFrameMs;
+  self->buffer_pool_mode = GST_WEBRTC_NET_EQ_BUFFER_POOL_MODE_PER_ELEMENT;
   self->output_buffer_pool = nullptr;
+  self->output_buffer_pool_size = 0;
   self->configured = FALSE;
   gst_segment_init(&self->segment, GST_FORMAT_TIME);
   self->segment_received = FALSE;
