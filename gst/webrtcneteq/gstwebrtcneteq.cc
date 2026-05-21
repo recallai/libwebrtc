@@ -776,11 +776,9 @@ static gboolean gst_webrtc_net_eq_ensure_neteq(GstWebrtcNetEq* self) {
   }
 
   webrtc::CodecParameterMap parameters;
-  if (self->channels == 2) {
-    parameters.emplace("stereo", "1");
-  }
+  parameters.emplace("stereo", self->channels == 2 ? "1" : "0");
   const webrtc::SdpAudioFormat opus_format("opus", self->clock_rate_hz,
-                                           static_cast<size_t>(self->channels),
+                                           /*num_channels=*/2,
                                            std::move(parameters));
   if (!state->neteq->RegisterPayloadType(self->payload_type, opus_format)) {
     GST_ERROR_OBJECT(self, "Failed to register Opus payload type %d",
@@ -946,12 +944,17 @@ static GstFlowReturn gst_webrtc_net_eq_pull_neteq_frame_locked(
     GstWebrtcNetEq* self,
     webrtc::AudioFrame* frame,
     bool* muted) {
+  frame->Reset();
   int decoded_rate_hz = 0;
   const int result =
       self->state->neteq->GetAudio(frame, muted, &decoded_rate_hz);
   if (result != webrtc::NetEq::kOK) {
-    GST_WARNING_OBJECT(self, "NetEQ GetAudio failed");
-    return GST_FLOW_ERROR;
+    GST_ERROR_OBJECT(self, "NetEQ GetAudio failed; emitting muted frame");
+    frame->UpdateFrame(
+        0, nullptr, webrtc::SampleRateToDefaultChannelSize(self->clock_rate_hz),
+        self->clock_rate_hz, webrtc::AudioFrame::kPLC,
+        webrtc::AudioFrame::kVadPassive, static_cast<size_t>(self->channels));
+    *muted = true;
   }
 
   const int rate =
