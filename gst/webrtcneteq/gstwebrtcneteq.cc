@@ -479,6 +479,14 @@ static GstClockTime gst_webrtc_net_eq_add_time(GstClockTime time,
   return time + delta;
 }
 
+static GstClockTime gst_webrtc_net_eq_output_pts(GstWebrtcNetEq* self,
+                                                 GstClockTime output_base_pts,
+                                                 guint64 output_samples) {
+  return gst_webrtc_net_eq_add_time(
+      output_base_pts,
+      gst_util_uint64_scale(output_samples, GST_SECOND, self->clock_rate_hz));
+}
+
 static std::optional<GstClockTime> gst_webrtc_net_eq_buffer_timestamp(
     GstBuffer* buffer) {
   GstClockTime timestamp = GST_BUFFER_PTS(buffer);
@@ -1056,9 +1064,7 @@ static GstFlowReturn gst_webrtc_net_eq_create_audio_locked(
   }
 
   GST_BUFFER_PTS(output.get()) =
-      output_base_pts +
-      gst_util_uint64_scale(*output_samples, GST_SECOND,
-                            self->clock_rate_hz);
+      gst_webrtc_net_eq_output_pts(self, output_base_pts, *output_samples);
   GST_BUFFER_DURATION(output.get()) =
       gst_util_uint64_scale(samples_per_channel, GST_SECOND,
                             self->clock_rate_hz);
@@ -1119,12 +1125,6 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
     return;
   }
   guint64 output_samples = 0;
-  std::optional<GstClockTime> running_time =
-      gst_webrtc_net_eq_running_time(self);
-  if (!running_time.has_value()) {
-    GST_ERROR_OBJECT(self, "Cannot start playout without a pipeline clock");
-    return;
-  }
   gint output_frame_ms;
   guint pulls_per_output_buffer;
   {
@@ -1139,8 +1139,17 @@ static void gst_webrtc_net_eq_playout_loop(GstWebrtcNetEq* self) {
   GstClockID raw_clock_id = nullptr;
   {
     GMutexLock lock(&self->lock);
+    const GstClockTime first_output_pts =
+        gst_webrtc_net_eq_output_pts(self, output_base_pts, output_samples);
+    if (!GST_CLOCK_TIME_IS_VALID(first_output_pts)) {
+      GST_WARNING_OBJECT(self, "Cannot schedule playout from output PTS");
+      return;
+    }
+    // Pace against the first output buffer timestamp. If startup is delayed
+    // after output_base_pts is latched, the periodic clock fires early until
+    // the output schedule catches up instead of preserving a permanent offset.
     raw_clock_id = gst_webrtc_net_eq_start_periodic_wait_locked(
-        self, *running_time, output_frame_duration);
+        self, first_output_pts, output_frame_duration);
     if (raw_clock_id == nullptr) {
       return;
     }
